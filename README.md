@@ -114,6 +114,8 @@ flowchart TB
             subgraph BM2["A100 BM #2 — 8 GPUs"]
                 Pod2["TorchTitan Trainer Pod 2<br/>(Monarch actors · replica 1)"]
             end
+
+            Fabric["RDMA (RoCE) fabric<br/>FSDP + inter-replica gradient allreduce"]
         end
     end
 
@@ -123,13 +125,14 @@ flowchart TB
     Controller -->|orchestrates| Pod1
     Controller -->|orchestrates| Pod2
 
-    LH <-->|per-step quorum / failure detection| Pod1
-    LH <-->|per-step quorum / failure detection| Pod2
+    LH -->|per-step quorum / failure detection| Pod1
+    LH -->|per-step quorum / failure detection| Pod2
 
-    Pod1 <==>|"RDMA (RoCE) — intra-replica FSDP<br/>+ inter-replica gradient allreduce"| Pod2
+    Pod1 <==> Fabric
+    Pod2 <==> Fabric
 
     classDef rdma stroke:#2563eb,stroke-width:3px;
-    class Pod1,Pod2 rdma;
+    class Pod1,Pod2,Fabric rdma;
 ```
 
 **How the layers stack:**
@@ -140,7 +143,7 @@ flowchart TB
 - **Monarch Controller** — the single Python script that describes and orchestrates the whole job.
 - **TorchTitan Trainers** — 2 pods, one per A100 bare-metal node, 8 GPUs each (16 total), running as Monarch actors.
 - **TorchFT Lighthouse** — a Monarch actor acting as the coordination server for per-step fault tolerance.
-- **RDMA (RoCE)** — the fast fabric (bold blue link) carrying both intra-replica FSDP traffic and inter-replica gradient allreduce at line rate.
+- **RDMA (RoCE)** — the fast fabric (bold blue) that both pods attach to, carrying intra-replica FSDP traffic and inter-replica gradient allreduce at line rate.
 
 ## Conclusion
 
