@@ -20,9 +20,16 @@ jobs.
 """
 
 import argparse
+import os
 import signal
 import socket
 import threading
+
+# Quiet the torchft Rust loggers (per-step "Quorum status: ..." chatter). Must
+# be set BEFORE the torchft import — env_logger / tracing-subscriber read
+# RUST_LOG once at load time. Override with RUST_LOG=info (or =debug) before
+# launching for failure-injection debugging.
+os.environ.setdefault("RUST_LOG", "warn")
 
 from torchft.coordination import LighthouseServer
 from torchtitan.tools.logging import init_logger, logger

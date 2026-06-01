@@ -35,7 +35,7 @@ kubectl cp controller.py monarch-tests/monarch-controller:/tmp/controller.py
 kubectl exec -it monarch-controller -n monarch-tests -- \
   python /tmp/controller.py --namespace monarch-tests \
     --training-steps 100 \
-    --image ghcr.io/dochakov-oci/monarch-oci:titan-torchft-nvidia-8b-01 \
+    --image ghcr.io/dochakov-oci/monarch-oci:titan-torchft-nvidia-8b-rdma-01 \
     --replica-count 2 --gpus-per-host 8
 ```
 

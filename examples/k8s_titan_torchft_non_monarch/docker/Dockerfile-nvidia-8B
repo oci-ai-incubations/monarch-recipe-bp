@@ -1,6 +1,39 @@
 ARG BASE_IMAGE=ocir.ap-sydney-1.oci.oraclecloud.com/iduyx1qnmway/meta-pytorch/monarch:hossein-ft-v5
 FROM ${BASE_IMAGE}
 
+ENV DEBIAN_FRONTEND=noninteractive
+
+# === DOCA-OFED userspace for RDMA / InfiniBand ================================
+# Installs the Mellanox userspace (libibverbs, librdmacm, libmlx5) that NCCL
+# needs to drive Mellanox CX-6/CX-7 RDMA VFs injected by the
+# monarch-sriov-vf-injector webhook (see .claude/skills/sriov-setup/). Without
+# this layer NCCL falls back to TCP-over-IP and we lose the RDMA fast-path.
+#
+# Mirrors the RDMA layer in
+# ../../k8s_ddp_cnn/docker/Dockerfile-nvidia-rdma — same DOCA 3.2.1 release,
+# same Ubuntu 24.04 / x86_64 channel. The base image (Monarch) is built on
+# Ubuntu 24.04, so the same DOCA stream applies. The cleanup step at the start
+# removes any pre-seeded Mellanox/DOCA apt sources from the base image to avoid
+# version conflicts.
+RUN set -eux; \
+    rm -f /etc/apt/sources.list.d/*doca* \
+          /etc/apt/sources.list.d/*mellanox* \
+          /etc/apt/sources.list.d/*mlnx* \
+          /etc/apt/sources.list.d/nvidia-doca* 2>/dev/null || true; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ca-certificates curl gnupg; \
+    curl -fsSL https://linux.mellanox.com/public/repo/doca/GPG-KEY-Mellanox.pub \
+        | gpg --dearmor -o /etc/apt/trusted.gpg.d/GPG-KEY-Mellanox.gpg; \
+    echo "deb [signed-by=/etc/apt/trusted.gpg.d/GPG-KEY-Mellanox.gpg] https://linux.mellanox.com/public/repo/doca/3.2.1/ubuntu24.04/x86_64/ ./" \
+        > /etc/apt/sources.list.d/doca.list; \
+    apt-mark showhold | xargs -r apt-mark unhold; \
+    apt-get update; \
+    apt-get install -y --allow-downgrades --allow-change-held-packages \
+        doca-ofed-userspace=3.2.1-044000; \
+    rm -rf /var/lib/apt/lists/*; \
+    ldconfig
+# === /DOCA-OFED userspace =====================================================
+
 # Public mirror of the Llama3 128256-vocab tokenizer. Every Llama3 flavor —
 # 1B, 3B, 8B, 70B, 405B — uses the same tokenizer; only the weights differ
 # (and torchtitan initializes weights from scratch, so no weights are baked
@@ -21,3 +54,76 @@ snapshot_download(repo_id=os.environ['TOKENIZER_REPO'], \
 local_dir=os.environ['TOKENIZER_DIR'], \
 allow_patterns=['tokenizer*', 'special_tokens*'])" \
     && ls -la "${TOKENIZER_DIR}"
+
+# === Patched TorchFT (Python) =================================================
+# Overlay a locally-patched copy of the torchft Python package onto the
+# installation already present in the base image. The base image's torchft
+# (`/opt/torchft/torchft/`) has two bugs that silently halve the cross-replica
+# gradient when training with 2 replicas × N FSDP ranks:
+#   1. `Manager.allreduce` zeroes the local tensor whenever `is_participating()`
+#      returns False, including when the only reason is `_healing=True`. With
+#      persistent per-(replica_id, group_rank) heal flags from the lighthouse,
+#      half the ranks per replica stay in `_healing=True` for the whole run,
+#      so their gradients are zeroed every step.
+#   2. `Manager.should_commit`'s async-quorum branch never resets `_healing`
+#      back to False after `_apply_pending_state_dict()`, so once a rank goes
+#      into heal it stays there until the next `start_quorum` cycle.
+#
+# The patched copy lives next to this Dockerfile at ./torchft_src/ in the
+# build context. To prepare the build context, copy the patched source
+# directory next to this Dockerfile before invoking `podman build` / `docker
+# build`:
+#
+#   cp -r /Users/dochakov/tmp/torchft_src \
+#         examples/k8s_titan_torchft_non_monarch/docker/torchft_src
+#
+# The .so extension (the compiled Rust bindings shipped in the base image at
+# /opt/torchft/torchft/_torchft.cpython-*-x86_64-linux-gnu.so) is left alone —
+# we only overlay the .py files. The Rust binary is unchanged by these
+# patches.
+COPY torchft_src/ /opt/torchft/torchft.patched/
+RUN find /opt/torchft/torchft.patched -name "*.py" -print0 \
+        | xargs -0 -I{} bash -c 'src="$1"; dst="/opt/torchft/torchft${src#/opt/torchft/torchft.patched}"; mkdir -p "$(dirname "$dst")"; cp "$src" "$dst"' _ {} \
+    && rm -rf /opt/torchft/torchft.patched \
+    && python -c "import torchft.manager, inspect; src = inspect.getsource(torchft.manager.Manager.allreduce); assert 'self._participating_replica_rank is None' in src, 'allreduce patch missing'; src2 = inspect.getsource(torchft.manager.Manager.should_commit); assert src2.count('self._healing = False') >= 1, 'should_commit patch missing'; print('torchft patches verified OK')"
+# === /Patched TorchFT =========================================================
+
+# === Patched TorchTitan FT trainer (loss reporting) ==========================
+# Fix the cross-replica double-counting in `global_avg_loss` reporting. The
+# upstream code passes `ft_pg` to dist_sum, which (combined with our torchft
+# patch above) makes the loss-reporting reduction actually fire — but each
+# rank's `loss` is already pre-divided by per-replica `global_valid_tokens`,
+# so the cross-replica sum produces `num_replicas × per_replica_avg_loss`
+# instead of the global average. With 2 replicas, the reported start-of-
+# training loss becomes ~24 (sum) instead of the expected ~12 (per-replica
+# avg ≈ log(vocab_size) for random Llama-3 init).
+#
+# Math: each rank computes `loss = local_loss_sum / global_valid_tokens`
+# where `global_valid_tokens` is summed only over `batch_mesh` (8 FSDP DP
+# ranks within the replica), NOT across `ft_pg`. The comment in trainer.py
+# claims `sum(loss) = global_avg_loss`, but that identity only holds when
+# `global_valid_tokens` is the same on every rank in the sum — which is
+# false once the cross-replica reduction is included.
+#
+# Fix: drop `ft_pg` from the `dist_sum` for `global_avg_loss` so it stays a
+# per-replica average. The other two reductions in that block are correct
+# as-is: `dist_max(local_avg_loss, ..., ft_pg)` correctly produces the
+# max-of-replicas, and `dist_sum(ntokens_seen, ..., ft_pg)` is intentionally
+# the global token counter.
+#
+# Gradient math is unaffected — this only patches the reporting path.
+# Use shell (find + sed + grep) instead of `python -c "import torchtitan..."`
+# for both the path lookup and the verification — `import
+# torchtitan.experiments.ft.trainer` pulls in FSDP / DTensor / NCCL C++
+# extensions that segfault under qemu when cross-building on a different host
+# arch (e.g. arm64 macOS host + linux/amd64 base image). Shell-only patch
+# avoids the import entirely.
+RUN TRAINER_PATH=$(find /opt /usr/local/lib -path '*/torchtitan/experiments/ft/trainer.py' -type f 2>/dev/null | head -1) \
+    && [ -n "$TRAINER_PATH" ] || (echo "torchtitan trainer.py not found" >&2; exit 1) \
+    && echo "Patching: $TRAINER_PATH" \
+    && [ "$(grep -c 'dist_utils\.dist_sum(loss, loss_mesh, ft_pg)' "$TRAINER_PATH")" = "1" ] \
+    && sed -i 's|dist_utils\.dist_sum(loss, loss_mesh, ft_pg)|dist_utils.dist_sum(loss, loss_mesh, None)|' "$TRAINER_PATH" \
+    && grep -q 'dist_utils\.dist_sum(loss, loss_mesh, None)' "$TRAINER_PATH" \
+    && ! grep -q 'dist_utils\.dist_sum(loss, loss_mesh, ft_pg)' "$TRAINER_PATH" \
+    && echo "torchtitan FT loss-reporting patch verified OK"
+# === /Patched TorchTitan FT trainer ==========================================

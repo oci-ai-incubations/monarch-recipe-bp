@@ -93,7 +93,7 @@ spec:
       effect: "NoSchedule"
   containers:
     - name: controller
-      image: ghcr.io/dochakov-oci/monarch-oci:titan-torchft-nvidia-8b-01
+      image: ghcr.io/dochakov-oci/monarch-oci:titan-torchft-nvidia-8b-rdma-01
       command: ["sleep"]
       args: ["infinity"]
       volumeMounts:

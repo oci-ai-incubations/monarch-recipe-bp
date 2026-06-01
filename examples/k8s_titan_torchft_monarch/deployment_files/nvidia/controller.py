@@ -7,11 +7,18 @@
 import argparse
 import asyncio
 import atexit
+import logging
 import os
 import textwrap
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Dict
+
+# Quiet the torchft Rust loggers (per-step "got lighthouse quorum" /
+# "should_commit request from N" chatter). Must be set BEFORE any torchft
+# import — env_logger / tracing-subscriber read RUST_LOG once at load time.
+# Users can override by exporting RUST_LOG=info (or =debug) before launching.
+os.environ.setdefault("RUST_LOG", "warn")
 
 import torch
 from monarch.config import configure
@@ -23,11 +30,14 @@ configure(
 )
 
 from kubernetes.client import (
+    V1Capabilities,
     V1Container,
     V1EmptyDirVolumeSource,
     V1EnvVar,
+    V1HostPathVolumeSource,
     V1PodSpec,
     V1ResourceRequirements,
+    V1SecurityContext,
     V1Volume,
     V1VolumeMount,
 )
@@ -93,22 +103,73 @@ _WORKER_BOOTSTRAP_SCRIPT: str = textwrap.dedent("""\
 """)
 
 
+def _quiet_torchft_python_loggers() -> None:
+    """Drop torchft's Python loggers to WARNING.
+
+    Suppresses the per-step routine lines:
+        torchft.manager - INFO - [.../N - step X] should_commit=True ...
+    Warnings and errors still print. Override with TORCHFT_LOG_LEVEL=INFO if
+    you need the per-step chatter back (e.g. when debugging recovery).
+    """
+    level = os.environ.get("TORCHFT_LOG_LEVEL", "WARNING").upper()
+    logging.getLogger("torchft.manager").setLevel(level)
+    logging.getLogger("torchft.checkpointing").setLevel(level)
+
+
 def build_gpu_pod_spec(image: str, gpus_per_host: int) -> V1PodSpec:
-    """Build a V1PodSpec with GPU resources and shared memory for NCCL."""
-    gpu_resources = {"nvidia.com/gpu": str(gpus_per_host)}
+    """Build a V1PodSpec for a worker pod with RDMA/InfiniBand.
+
+    GPU resources, shared memory for NCCL, plus RDMA: IPC_LOCK +
+    privileged mode pin memory for RDMA, and the
+    ``nvidia.com/sriov-rdma-vf`` request triggers the
+    monarch-sriov-vf-injector webhook (Multus annotation
+    ``k8s.v1.cni.cncf.io/networks=sriov-rdma-vf``) so a Mellanox VF
+    netdev is plumbed into the pod netns for NCCL. One VF is requested
+    per physical RDMA port on the node (16 CX-6 data-plane ports per
+    a100-sriov-policy.yaml), not one per GPU — so each pod consumes the
+    node's full VF pool. hostNetwork is deliberately NOT set: the
+    Monarch K8s operator discovers workers via pod DNS, and hostNetwork
+    would break that (socket.getfqdn() resolves to the node FQDN, not
+    the pod DNS name).
+    """
+    gpu_resources = {
+        "nvidia.com/gpu": str(gpus_per_host),
+        "nvidia.com/sriov-rdma-vf": "16",
+    }
+    # Propagate RUST_LOG to worker pods so torchft's Rust loggers stay quiet
+    # on the worker side too. Inherits from the controller's env (set at the
+    # top of this file) but can be overridden by exporting RUST_LOG before
+    # launching the controller.
+    rust_log = os.environ.get("RUST_LOG", "warn")
     return V1PodSpec(
         containers=[
             V1Container(
                 name="worker",
                 image=image,
                 command=["python", "-u", "-c", _WORKER_BOOTSTRAP_SCRIPT],
-                env=[V1EnvVar(name="MONARCH_PORT", value="26600")],
+                env=[
+                    V1EnvVar(name="MONARCH_PORT", value="26600"),
+                    V1EnvVar(name="RUST_LOG", value=rust_log),
+                    V1EnvVar(name="NCCL_IB_DISABLE", value="0"),
+                    V1EnvVar(name="NCCL_IB_HCA", value="mlx5"),
+                    V1EnvVar(name="NCCL_IB_GID_INDEX", value="3"),
+                    V1EnvVar(name="NCCL_IB_TC", value="41"),
+                    V1EnvVar(name="NCCL_IB_SL", value="0"),
+                    V1EnvVar(name="NCCL_IB_QPS_PER_CONNECTION", value="4"),
+                    V1EnvVar(name="NCCL_NET_GDR_LEVEL", value="PHB"),
+                    V1EnvVar(name="NCCL_DEBUG", value="INFO"),
+                ],
+                security_context=V1SecurityContext(
+                    privileged=True,
+                    capabilities=V1Capabilities(add=["IPC_LOCK"]),
+                ),
                 resources=V1ResourceRequirements(
                     limits=gpu_resources,
                     requests=gpu_resources,
                 ),
                 volume_mounts=[
                     V1VolumeMount(name="dshm", mount_path="/dev/shm"),
+                    V1VolumeMount(name="infiniband", mount_path="/dev/infiniband"),
                 ],
             )
         ],
@@ -116,7 +177,11 @@ def build_gpu_pod_spec(image: str, gpus_per_host: int) -> V1PodSpec:
             V1Volume(
                 name="dshm",
                 empty_dir=V1EmptyDirVolumeSource(medium="Memory", size_limit="16Gi"),
-            )
+            ),
+            V1Volume(
+                name="infiniband",
+                host_path=V1HostPathVolumeSource(path="/dev/infiniband"),
+            ),
         ],
     )
 
@@ -193,6 +258,7 @@ class TrainingActor(Actor):
     @endpoint(instrument=False)
     async def start_training(self, lighthouse_address: str) -> None:
         init_logger()
+        _quiet_torchft_python_loggers()
 
         os.environ["TORCHFT_LIGHTHOUSE"] = lighthouse_address
         trainer = self.trainer_config.build()
@@ -289,6 +355,7 @@ class ReplicaActor(Actor):
     @endpoint(instrument=False)
     async def start_replica(self) -> None:
         init_logger()
+        _quiet_torchft_python_loggers()
         self._loop = asyncio.get_running_loop()
         for attempt in range(PROC_ATTEMPTS):
             try:
@@ -588,9 +655,14 @@ def make_job_spec(args: argparse.Namespace) -> JobSpec:
         checkpoint=CheckpointManager.Config(),
         activation_checkpoint=ActivationCheckpointConfig(mode="selective"),
         comm=CommConfig(train_timeout_seconds=300),
+        # group_size is the NUMBER OF REPLICAS (the dataloader's outer
+        # dimension multiplier), NOT the FSDP shard degree. Passing the FSDP
+        # shard degree here makes FTManager.get_dp_info compute
+        # dp_world_size = fsdp_degree * fsdp_degree, telling the c4 dataloader
+        # to split into far more shards than there are readers.
         fault_tolerance=FaultTolerance(
             enable=args.torchft,
-            group_size=data_parallel_shard_degree,
+            group_size=args.replica_count,
             process_group="nccl",
             process_group_timeout_ms=180000,
         ),
@@ -612,6 +684,7 @@ def make_job_spec(args: argparse.Namespace) -> JobSpec:
 
 async def main() -> None:
     init_logger()
+    _quiet_torchft_python_loggers()
 
     args = parse_args()
     job_spec = make_job_spec(args)
