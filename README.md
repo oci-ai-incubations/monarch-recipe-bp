@@ -94,6 +94,57 @@ All runs train Llama 3 8B on C4 for **1000 steps** on **2 × A100 BM (16 GPUs)**
 
 > **Note on 3.5:** Kueue adds gang scheduling and RDMA topology-aware admission. It is invisible during steady-state training — it changes how jobs *land* on and *share* the cluster, not the training math or per-step wall-clock — so its throughput metrics match 3.4.
 
+### Architecture Diagram
+
+Here's what the running system looks like end-to-end (*the final configuration 3.5*):
+
+```mermaid
+flowchart TB
+    subgraph OCI["OCI — Oracle Cloud Infrastructure"]
+        subgraph OKE["OKE (Oracle Kubernetes Engine)"]
+            Kueue["Kueue<br/>(gang + RDMA topology-aware scheduling)"]
+            Operator["Monarch Operator"]
+            Controller["Monarch Controller<br/>(single Python script)"]
+            LH["TorchFT Lighthouse<br/>(Monarch actor — coordination server)"]
+
+            subgraph BM1["A100 BM #1 — 8 GPUs"]
+                Pod1["TorchTitan Trainer Pod 1<br/>(Monarch actors · replica 0)"]
+            end
+
+            subgraph BM2["A100 BM #2 — 8 GPUs"]
+                Pod2["TorchTitan Trainer Pod 2<br/>(Monarch actors · replica 1)"]
+            end
+
+            Fabric["RDMA (RoCE) fabric<br/>FSDP + inter-replica gradient allreduce"]
+        end
+    end
+
+    Kueue -->|admits & gang-schedules| Operator
+    Operator -->|provisions pods| Pod1
+    Operator -->|provisions pods| Pod2
+    Controller -->|orchestrates| Pod1
+    Controller -->|orchestrates| Pod2
+
+    LH -->|per-step quorum / failure detection| Pod1
+    LH -->|per-step quorum / failure detection| Pod2
+
+    Pod1 <==> Fabric
+    Pod2 <==> Fabric
+
+    classDef rdma stroke:#2563eb,stroke-width:3px;
+    class Pod1,Pod2,Fabric rdma;
+```
+
+**How the layers stack:**
+
+- **OCI + OKE** — the base cloud and managed Kubernetes layer everything runs on.
+- **Kueue** — admits the job atomically (gang scheduling) and places pods to minimize RDMA switch hops (topology-aware).
+- **Monarch Operator** — the OKE operator that provisions the worker pods Monarch needs.
+- **Monarch Controller** — the single Python script that describes and orchestrates the whole job.
+- **TorchTitan Trainers** — 2 pods, one per A100 bare-metal node, 8 GPUs each (16 total), running as Monarch actors.
+- **TorchFT Lighthouse** — a Monarch actor acting as the coordination server for per-step fault tolerance.
+- **RDMA (RoCE)** — the fast fabric (bold blue) that both pods attach to, carrying intra-replica FSDP traffic and inter-replica gradient allreduce at line rate.
+
 ## Conclusion
 
 Combined with everything we built up to 3.4, the system now has:
