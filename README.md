@@ -107,15 +107,12 @@ flowchart TB
             Controller["Monarch Controller<br/>(single Python script)"]
             LH["TorchFT Lighthouse<br/>(Monarch actor — coordination server)"]
 
-            subgraph Nodes[" "]
-                direction LR
-                subgraph BM1["A100 BM #1 — 8 GPUs"]
-                    Pod1["TorchTitan Trainer Pod 1<br/>(Monarch actors · replica 0)"]
-                end
+            subgraph BM1["A100 BM #1 — 8 GPUs"]
+                Pod1["TorchTitan Trainer Pod 1<br/>(Monarch actors · replica 0)"]
+            end
 
-                subgraph BM2["A100 BM #2 — 8 GPUs"]
-                    Pod2["TorchTitan Trainer Pod 2<br/>(Monarch actors · replica 1)"]
-                end
+            subgraph BM2["A100 BM #2 — 8 GPUs"]
+                Pod2["TorchTitan Trainer Pod 2<br/>(Monarch actors · replica 1)"]
             end
         end
     end
@@ -133,7 +130,6 @@ flowchart TB
 
     classDef rdma stroke:#2563eb,stroke-width:3px;
     class Pod1,Pod2 rdma;
-    style Nodes fill:none,stroke:none;
 ```
 
 **How the layers stack:**
