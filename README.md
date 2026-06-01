@@ -88,6 +88,10 @@ All runs train Llama 3 8B on C4 for **1000 steps** on **2 × A100 BM (16 GPUs)**
 | [3.4](https://github.com/oci-ai-incubations/monarch-recipe-bp/blob/cfg4_oke_torchtitan_monarch_torchft_rdma/examples/k8s_titan_torchft_monarch/README.md) + RDMA (RoCE) | 2566 s | 12.23993 → 4.30832 | Success | **54.25%** | 3288 | 169.25 | 0.9664 | 55.12 GiB |
 | [3.5](https://github.com/oci-ai-incubations/monarch-recipe-bp/blob/cfg5_oke_torchtitan_monarch_torchft_rdma_kueue/examples/k8s_titan_torchft_monarch/README.md) + Kueue | same as 3.4 | same as 3.4 | Success | — | — | — | — | — |
 
+> **Note on 3.3:** TorchFT buys per-step fault tolerance but is ~2.5× slower — its cross-replica gradient allreduce runs over the slow TCP/IP pod overlay instead of RDMA.
+
+> **Note on 3.4:** Moving that allreduce onto the RDMA fabric (RoCE) erases the 3.3 slowdown, back to baseline throughput with fault tolerance kept.
+
 > **Note on 3.5:** Kueue adds gang scheduling and RDMA topology-aware admission. It is invisible during steady-state training — it changes how jobs *land* on and *share* the cluster, not the training math or per-step wall-clock — so its throughput metrics match 3.4.
 
 ## Conclusion
