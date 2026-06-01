@@ -25,7 +25,15 @@ overrides.
 """
 
 import argparse
+import logging
 import os
+
+# Quiet the torchft Rust loggers (per-step "got lighthouse quorum" /
+# "should_commit request from N" chatter). Must be set BEFORE any torchft
+# import — env_logger / tracing-subscriber read RUST_LOG once at load time.
+# Override with RUST_LOG=info (or =debug) before launching for
+# failure-injection debugging.
+os.environ.setdefault("RUST_LOG", "warn")
 
 import torch
 from torchtitan.components.checkpoint import CheckpointManager
@@ -167,18 +175,37 @@ def build_trainer_config(args: argparse.Namespace) -> FaultTolerantTrainer.Confi
         checkpoint=CheckpointManager.Config(),
         activation_checkpoint=ActivationCheckpointConfig(mode="selective"),
         comm=CommConfig(train_timeout_seconds=300),
+        # group_size is the NUMBER OF REPLICAS (the dataloader's outer
+        # dimension multiplier), NOT the FSDP shard degree. Passing the FSDP
+        # shard degree here makes FTManager.get_dp_info compute
+        # dp_world_size = fsdp_degree * fsdp_degree, telling the c4 dataloader
+        # to split into far more shards than there are readers.
         fault_tolerance=FaultTolerance(
             enable=args.torchft,
             replica_id=args.replica_id,
-            group_size=data_parallel_shard_degree,
+            group_size=args.replica_count,
             process_group="nccl",
             process_group_timeout_ms=180000,
         ),
     )
 
 
+def _quiet_torchft_python_loggers() -> None:
+    """Drop torchft's Python loggers to WARNING.
+
+    Suppresses the per-step routine lines:
+        torchft.manager - INFO - [.../N - step X] should_commit=True ...
+    Warnings and errors still print. Override with TORCHFT_LOG_LEVEL=INFO if
+    you need the per-step chatter back (e.g. when debugging recovery).
+    """
+    level = os.environ.get("TORCHFT_LOG_LEVEL", "WARNING").upper()
+    logging.getLogger("torchft.manager").setLevel(level)
+    logging.getLogger("torchft.checkpointing").setLevel(level)
+
+
 def main() -> None:
     init_logger()
+    _quiet_torchft_python_loggers()
     args = parse_args()
 
     if args.torchft and "TORCHFT_LIGHTHOUSE" not in os.environ:

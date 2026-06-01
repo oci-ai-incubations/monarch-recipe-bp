@@ -66,7 +66,7 @@ spec:
       effect: "NoSchedule"
   containers:
     - name: lighthouse
-      image: ghcr.io/dochakov-oci/monarch-oci:titan-torchft-nvidia-8b-01
+      image: ghcr.io/dochakov-oci/monarch-oci:titan-torchft-nvidia-8b-rdma-01
       command: ["sleep"]
       args: ["infinity"]
       ports:
@@ -106,9 +106,21 @@ spec:
       effect: "NoSchedule"
   containers:
     - name: trainer
-      image: ghcr.io/dochakov-oci/monarch-oci:titan-torchft-nvidia-8b-01
+      image: ghcr.io/dochakov-oci/monarch-oci:titan-torchft-nvidia-8b-rdma-01
       command: ["sleep"]
       args: ["infinity"]
+      # RDMA: IPC_LOCK + privileged are required to pin memory for RDMA. The
+      # ``nvidia.com/sriov-rdma-vf`` resource request triggers the
+      # monarch-sriov-vf-injector webhook (Multus annotation
+      # ``k8s.v1.cni.cncf.io/networks=sriov-rdma-vf``) so a Mellanox VF netdev
+      # is plumbed into the pod netns for NCCL. One VF per physical RDMA port
+      # on the node (16 CX-6 data-plane ports per a100-sriov-policy.yaml),
+      # which means each replica pod consumes the node's full VF pool —
+      # consistent with podAntiAffinity (one replica per node).
+      securityContext:
+        privileged: true
+        capabilities:
+          add: ["IPC_LOCK"]
       env:
         - name: REPLICA_ID
           value: "0"
@@ -141,19 +153,40 @@ spec:
           value: "600"
         - name: TORCHFT_QUORUM_RETRIES
           value: "0"
+        - name: NCCL_IB_DISABLE
+          value: "0"
+        - name: NCCL_IB_HCA
+          value: "mlx5"
+        - name: NCCL_IB_GID_INDEX
+          value: "3"
+        - name: NCCL_IB_TC
+          value: "41"
+        - name: NCCL_IB_SL
+          value: "0"
+        - name: NCCL_IB_QPS_PER_CONNECTION
+          value: "4"
+        - name: NCCL_NET_GDR_LEVEL
+          value: "PHB"
       resources:
         limits:
           nvidia.com/gpu: "8"
+          nvidia.com/sriov-rdma-vf: "16"
         requests:
           nvidia.com/gpu: "8"
+          nvidia.com/sriov-rdma-vf: "16"
       volumeMounts:
         - name: dshm
           mountPath: /dev/shm
+        - name: infiniband
+          mountPath: /dev/infiniband
   volumes:
     - name: dshm
       emptyDir:
         medium: Memory
         sizeLimit: 16Gi
+    - name: infiniband
+      hostPath:
+        path: /dev/infiniband
 ---
 # Replica 1 — identical to replica 0 except for REPLICA_ID. Pod anti-affinity
 # guarantees it lands on a different node so each replica gets a full BM's
@@ -190,9 +223,14 @@ spec:
       effect: "NoSchedule"
   containers:
     - name: trainer
-      image: ghcr.io/dochakov-oci/monarch-oci:titan-torchft-nvidia-8b-01
+      image: ghcr.io/dochakov-oci/monarch-oci:titan-torchft-nvidia-8b-rdma-01
       command: ["sleep"]
       args: ["infinity"]
+      # See replica-0 securityContext comment above for RDMA rationale.
+      securityContext:
+        privileged: true
+        capabilities:
+          add: ["IPC_LOCK"]
       env:
         - name: REPLICA_ID
           value: "1"
@@ -220,16 +258,37 @@ spec:
           value: "600"
         - name: TORCHFT_QUORUM_RETRIES
           value: "0"
+        - name: NCCL_IB_DISABLE
+          value: "0"
+        - name: NCCL_IB_HCA
+          value: "mlx5"
+        - name: NCCL_IB_GID_INDEX
+          value: "3"
+        - name: NCCL_IB_TC
+          value: "41"
+        - name: NCCL_IB_SL
+          value: "0"
+        - name: NCCL_IB_QPS_PER_CONNECTION
+          value: "4"
+        - name: NCCL_NET_GDR_LEVEL
+          value: "PHB"
       resources:
         limits:
           nvidia.com/gpu: "8"
+          nvidia.com/sriov-rdma-vf: "16"
         requests:
           nvidia.com/gpu: "8"
+          nvidia.com/sriov-rdma-vf: "16"
       volumeMounts:
         - name: dshm
           mountPath: /dev/shm
+        - name: infiniband
+          mountPath: /dev/infiniband
   volumes:
     - name: dshm
       emptyDir:
         medium: Memory
         sizeLimit: 16Gi
+    - name: infiniband
+      hostPath:
+        path: /dev/infiniband

@@ -6,7 +6,7 @@
   (`BM.GPU.H100.8` or `BM.GPU.A100-v2.8`).
 - `kubectl` configured for that cluster.
 - The image baked into [`provision.yaml`](./deployment_files/nvidia/provision.yaml)
-  (`ghcr.io/dochakov-oci/monarch-oci:titan-torchft-nvidia-8b-01`) must be
+  (`ghcr.io/dochakov-oci/monarch-oci:titan-torchft-nvidia-8b-rdma-01`) must be
   reachable from the cluster. It contains `torchtitan` (with `experiments/ft`),
   `torchft`, and the Llama3 128k-vocab tokenizer at
   `/opt/torchtitan/tokenizers/llama3` — required for the non-debug Llama3

@@ -1,4 +1,4 @@
-# Configuration: OKE + TorchTitan + `torchrun`
+# Configuration: OKE + TorchTitan + `torchrun` + TorchFT + RDMA
 
 [Deployment instructions](./Deployment.md)
 
