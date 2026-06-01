@@ -1,0 +1,36 @@
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ResourceFlavor
+metadata:
+  name: "a100-flavor"
+# spec:
+#   nodeLabels:
+#     node.kubernetes.io/instance-type: "BM.GPU.A100-v2.8"
+#   topologyName: "oci-rdma"
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: "a100-cluster-queue"
+spec:
+  namespaceSelector: {}
+  resourceGroups:
+  - coveredResources: ["cpu", "memory", "nvidia.com/gpu", "nvidia.com/sriov-rdma-vf"]
+    flavors:
+    - name: "a100-flavor"
+      resources:
+      - name: "cpu"
+        nominalQuota: 200
+      - name: "memory"
+        nominalQuota: 1000Gi
+      - name: "nvidia.com/gpu"
+        nominalQuota: 16
+      - name: "nvidia.com/sriov-rdma-vf"
+        nominalQuota: 32
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: LocalQueue
+metadata:
+  namespace: "monarch-tests"
+  name: "user-queue"
+spec:
+  clusterQueue: "a100-cluster-queue"
