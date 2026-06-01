@@ -1,0 +1,23 @@
+ARG BASE_IMAGE=ocir.ap-sydney-1.oci.oraclecloud.com/iduyx1qnmway/meta-pytorch/monarch:hossein-ft-v5
+FROM ${BASE_IMAGE}
+
+# Public mirror of the Llama3 128256-vocab tokenizer. Every Llama3 flavor —
+# 1B, 3B, 8B, 70B, 405B — uses the same tokenizer; only the weights differ
+# (and torchtitan initializes weights from scratch, so no weights are baked
+# into this image). The "3B" in the repo name is just where we source the
+# tokenizer files from; this image is appropriate for any non-debug flavor.
+# Using a non-gated mirror avoids needing an HF auth token at build time.
+ARG TOKENIZER_REPO=unsloth/Llama-3.2-3B
+ARG TOKENIZER_DIR=/opt/torchtitan/tokenizers/llama3
+ENV TOKENIZER_REPO=${TOKENIZER_REPO}
+ENV TOKENIZER_DIR=${TOKENIZER_DIR}
+
+# Installs the Llama3 tokenizer (vocab 128256) at /opt/torchtitan/tokenizers/llama3
+# so that train_titan_torchft.py / controller.py can train any non-debug
+# Llama3 flavor configured via MODEL_FLAVOR (currently "8B").
+RUN pip install --no-cache-dir --break-system-packages huggingface_hub && \
+    python -c "import os; from huggingface_hub import snapshot_download; \
+snapshot_download(repo_id=os.environ['TOKENIZER_REPO'], \
+local_dir=os.environ['TOKENIZER_DIR'], \
+allow_patterns=['tokenizer*', 'special_tokens*'])" \
+    && ls -la "${TOKENIZER_DIR}"
