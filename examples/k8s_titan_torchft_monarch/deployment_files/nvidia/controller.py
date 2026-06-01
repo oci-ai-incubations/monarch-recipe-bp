@@ -200,11 +200,13 @@ class MonarchKubernetes:
         image: str | None = None,
         gpus_per_host: int = 8,
         timeout: int | None = None,
+        kueue: str | None = None,
     ):
         self.namespace = namespace
         self.image = image
         self.gpus_per_host = gpus_per_host
         self.timeout = timeout
+        self.kueue = kueue
         self.job_handles: Dict[str, KubernetesJob] = {}
         self._is_owner = True
         atexit.register(self.kill_jobs)
@@ -219,11 +221,16 @@ class MonarchKubernetes:
 
     async def get_or_create_job(self, mesh_name: str) -> None:
         job = KubernetesJob(namespace=self.namespace, timeout=self.timeout)
+        labels = (
+            {"kueue.x-k8s.io/queue-name": self.kueue} if self.kueue else None
+        )
         if self.image is not None:
             pod_spec = build_gpu_pod_spec(self.image, self.gpus_per_host)
-            job.add_mesh(mesh_name, num_replicas=1, pod_spec=pod_spec)
+            job.add_mesh(
+                mesh_name, num_replicas=1, pod_spec=pod_spec, labels=labels
+            )
         else:
-            job.add_mesh(mesh_name, num_replicas=1)
+            job.add_mesh(mesh_name, num_replicas=1, labels=labels)
         self.job_handles[mesh_name] = job
 
     def kill_jobs(self):
@@ -388,6 +395,7 @@ class JobSpec:
     image: str | None = None
     timeout: int | None = None
     lighthouse_address: str = ""
+    kueue: str | None = None
 
 
 @dataclass
@@ -418,6 +426,7 @@ class OrchestrationManager:
             image=spec.image,
             gpus_per_host=spec.gpus_per_host,
             timeout=spec.timeout,
+            kueue=spec.kueue,
         )
         self._job_creation_lock = asyncio.Lock()
 
@@ -612,6 +621,19 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Maximum seconds to wait for pods to be ready (default: wait indefinitely)",
     )
+    parser.add_argument(
+        "--kueue",
+        type=str,
+        default=None,
+        help=(
+            "Kueue LocalQueue name (e.g. 'user-queue'). When set, each "
+            "replica's MonarchMesh is labeled with "
+            "kueue.x-k8s.io/queue-name=<name> so Kueue gates admission "
+            "(gang scheduling + Topology-Aware Scheduling). Requires the "
+            "Kueue Topology, ResourceFlavor, ClusterQueue, and LocalQueue "
+            "to already exist (see topology.yaml and kueue_quota.yaml)."
+        ),
+    )
 
     return parser.parse_args()
 
@@ -676,6 +698,7 @@ def make_job_spec(args: argparse.Namespace) -> JobSpec:
         namespace=args.namespace,
         image=args.image,
         timeout=args.timeout,
+        kueue=args.kueue,
     )
 
 
